@@ -23,17 +23,30 @@ using namespace std;
 
 using namespace std;
 
-enum Flow {serverSilence, clientSilence, request, response};
+enum class Flow {serverSilence, clientSilence, request, response, COUNT};
 class Data;
+
+class Config {
+	public:
+		bool dumpFlows = false;
+		bool showAll = false;
+		bool showConSummary = false;
+		double minSilencePeriod = 0.050;
+		double trivialDuration = 3;
+		long trivialResponseBytes=10000;
+		double longDuration = 20; 
+
+		double interestingKbps = 50;
+		bool showClassifyDetails = false;
+};
+
 class FlowRecord {
 	public:	
 		Flow flow;
 		long bytes;
-		//start time
 		double start;
 		double end;
 		long packets;
-		//end time	
 
 		FlowRecord (Flow f, long b, double timestamp) : flow(f), bytes(b), start(timestamp), end(timestamp), packets(1) {
 		};
@@ -48,18 +61,20 @@ class FlowRecord {
 
 		double duration() const { return end-start;} 
 		double kbps() const { return bytes*8/duration()/1024;} 
-
 };
 
 class ConnectionRecord {
 	public:
 		deque<FlowRecord> flows;
 		double silenceThreshold = 0.050; //050ms approx
-		
-		void packet(Flow f, long bytes, double timestamp);
-		void dump(const Data *parent) const;
+	   string classification;
+		string classificationDetail;
+
+		void packet(Config &config, Flow f, long bytes, double timestamp);
+		void dump(Config &config) ;
 		double duration() const { return end-start;} 
-		double kbps() const { return totalBytes*8/duration()/1024;} 
+		double kbps() const { return totalBytes*8/duration()/1024;}
+		void classify(Config &config);
 	private:
 		double start;
 		double end;
@@ -71,8 +86,9 @@ class Data {
 	public: 
 		map<string, ConnectionRecord > connections;
 		double startTime;
-		bool dumpFlows = false;
-		void dump() const;
+		void dump() ;
+		void classify();
+		Config config;
 };
 
 
@@ -86,15 +102,23 @@ int main(int argc, char* argv[]) {
 	pcap_t *descr;
 	char errbuf[PCAP_ERRBUF_SIZE];
 	Data data;
-	bool dumpFlows = false;
 	string filename;
 
+
 	cxxopts::Options options(argv[0], "Attempts to identify usage of tcp streams in a capture");
-	
 	options
 		.add_options()
 		("f,file", "Filename to process", cxxopts::value<std::string>())
-		("flows", "Dump flows", cxxopts::value<bool>(data.dumpFlows))
+		("showFlows", "Show flows", cxxopts::value<bool>(data.config.dumpFlows))
+		("showAll", "Show all connections, otherwise only show possible streams", cxxopts::value<bool>(data.config.showAll))
+		("showConSummary", "Show connection summary", cxxopts::value<bool>(data.config.showConSummary))
+		("showClassifyDetails", "Shows details during classify step", cxxopts::value<bool>(data.config.showClassifyDetails))
+		("minSilencePeriod", "Minimum silence period", cxxopts::value<double>(data.config.minSilencePeriod))
+		("trivialDuration", "Minimum connection duration to consider interesting", cxxopts::value<double>(data.config.trivialDuration))
+		("trivialResponseBytes", "Minimum response bytes consider interesting", cxxopts::value<long>(data.config.trivialResponseBytes))
+		("longDuration", "Minimum connection duration to consider as a candidate for being an ABR stream", cxxopts::value<double>(data.config.longDuration))
+		("interestingKbps", "Minimum kbps to consider as a candidate for being an ABR stream", cxxopts::value<double>(data.config.trivialDuration))
+
 		("help", "Print help")
 	;
 
@@ -128,6 +152,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	cout << "capture finished" << endl;
+	data.classify();
 	data.dump();
 	return 0;
 }
@@ -142,6 +167,18 @@ string makeKey(char *sourceIp, u_int sourcePort, char *destIp, u_int destPort) {
 		retVal = string(destIp)+":"+to_string(destPort) + "-" + string(sourceIp) + ":"+to_string(sourcePort);
 	}
 
+	return retVal;
+}
+
+string toString(Flow flow) {
+	string retVal;
+	switch(flow) {
+		case Flow::serverSilence: retVal = "serverSilence"; break;
+		case Flow::clientSilence: retVal = "clientSilence"; break;
+		case Flow::request: retVal = "request"; break;
+		case Flow::response: retVal = "response"; break;
+		default: retVal = "unknown ";
+	}	
 	return retVal;
 }
 
@@ -181,63 +218,123 @@ void packetHandler(u_char  *userData, const struct pcap_pkthdr* pkthdr, const u_
 			//we don't care about 0 byte packets - they are acks (or similar) and not true communication
 			if(dataLength > 0) { 
 				if(destPort < sourcePort) {
-					flow = request;
+					flow = Flow::request;
 				} else {
-					flow = response;
+					flow = Flow::response;
 				}
 			
 			
 				key = makeKey(sourceIp, sourcePort, destIp, destPort);
 				ConnectionRecord &cr = data->connections[key];
-				cr.packet(flow, dataLength, timestamp);
+				cr.packet(data->config, flow, dataLength, timestamp);
 			}
 		}
 	}
 }
 
-void Data::dump() const {
+void Data::dump() {
 	cout.precision(numeric_limits< double >::max_digits10);
-	for(const auto &c : connections) {
-		cout << endl << "Dumping connection " << c.first << endl;
-		c.second.dump(this);		
-	}
-}
-
-void ConnectionRecord::dump(const Data *parent) const {
-	cout << "\ttotalBytes\ttotalPackets\tduration\tstart\tend\tkbps" << endl;
-	cout << "\t" << totalBytes << "\t" << totalPackets << "\t" << duration() << "\t" << start << "\t" << end << "\t" << kbps() << endl;
-		
-	cout << endl;
-	if(parent->dumpFlows) {
-		cout << "flow\tbytes\tpackets\tduration\tstart\tend\tkbps" << endl;
-		for(const auto &flowRecord :  flows) {
-			switch(flowRecord.flow) {
-				case serverSilence: cout << "serverSilence "; break;
-				case clientSilence: cout << "clientSilence "; break;
-				case request: cout << "request "; break;
-				case response: cout << "response"; break;
-				default: cout << "unknown ";
-			}
-			cout << "\t" << flowRecord.bytes << "\t" << flowRecord.packets << "\t" << flowRecord.duration() << "\t" << flowRecord.start << "\t" << flowRecord.end << "\t" <<  flowRecord.kbps()<< endl;
+	for(auto &c : connections) {
+		if(config.showAll || c.second.classification == "Possible stream") {
+			cout << endl << "connection " << c.first << endl;
+			cout << c.second.classification << ": " << c.second.classificationDetail << endl;
+			c.second.dump(config);		
 		}
 	}
-
 }
 
-void ConnectionRecord::packet(Flow flow, long dataLength, double timestamp) {
+void Data::classify() {
+	for(auto &c : connections) {
+		c.second.classify(config);		
+	}
+}
+
+
+void ConnectionRecord::dump(Config &config) {
+
+	if(config.showConSummary) {
+		cout << "\ttotalBytes\ttotalPackets\tduration\tstart\tend\tkbps" << endl;
+		cout << "\t" << totalBytes << "\t" << totalPackets << "\t" << duration() << "\t" << start << "\t" << end << "\t" << kbps() << endl;
+	}
+
+	cout << endl;
+	if(config.dumpFlows) {
+		cout << "flow\tbytes\tpackets\tduration\tstart\tend\tkbps" << endl;
+		string flowType;
+		for(const auto &flowRecord :  flows) {
+			flowType = toString(flowRecord.flow);
+			cout << flowType << "\t" << flowRecord.bytes << "\t" << flowRecord.packets << "\t" << flowRecord.duration() << "\t" << flowRecord.start << "\t" << flowRecord.end << "\t" <<  flowRecord.kbps()<< endl;
+		}
+	}
+}
+
+/** Key logic to classify different connections based on their properties*/
+void ConnectionRecord::classify(Config &config) {
+	//Some very simple data extractoin.
+	//more advanced stats method, particularly quartiles, standard deviations etc would allow more sophisticated techniques
+	//machine learning approaches could also be interesting and fit well.
+	const int numFTypes = (int)Flow::COUNT;
+	const int req = (int)Flow::request;
+	const int resp = (int)Flow::response;
+	const int cliSi = (int)Flow::clientSilence;
+	long count[numFTypes]= {};
+	long gapAccum[numFTypes] = {};
+	long bytes[numFTypes] = {};
+	double dur[numFTypes] = {};
+	double lastEnd[numFTypes] = {};
+
+
+	for(const auto &flowRecord : flows) {
+		int flowType = (int)flowRecord.flow;
+		count[flowType] ++;
+		if(lastEnd[flowType] != 0) {
+			gapAccum[flowType] += flowRecord.end-lastEnd[flowType];
+		}
+		lastEnd[flowType] = flowRecord.end;
+		dur[flowType] += flowRecord.duration();
+		bytes[flowType] += flowRecord.bytes;
+	}
+
+	if(config.showClassifyDetails) {
+		cout << "req count" + to_string(count[req]) + " bytes " + to_string(bytes[req]) + " dur " + to_string(dur[req]) << endl;
+		cout << "resp count" + to_string(count[resp]) + " bytes " + to_string(bytes[resp]) + " dur " + to_string(dur[resp]) << endl;
+		cout << "cliSi count" + to_string(count[cliSi]) + " bytes " + to_string(bytes[cliSi]) + " dur " + to_string(dur[cliSi]) << endl;
+	}
+
+	//now demonstrate different classifications
+	if(count[req] == 0 && count[resp] == 0) {
+		classification = "Single Request/Response";
+		classificationDetail = "Request " + to_string(bytes[req]) + " bytes in " + to_string(dur[req]) + "s / Response " + to_string(bytes[resp]) + " bytes in " + to_string(dur[resp]);
+	} else if (bytes[resp] < config.trivialResponseBytes || duration() < config.trivialDuration) {
+		classification = "Trivial";
+		classificationDetail = "Response " + to_string(bytes[resp]) + " bytes total exchange duration  " + to_string(duration());
+	} else if (duration() > config.longDuration && kbps() > config.interestingKbps) {
+		classification = "Possible stream";
+		classificationDetail = "Request " + to_string(bytes[req]) + " bytes in " + to_string(dur[req]) + "s / Response " + to_string(bytes[resp]) + " bytes in " + to_string(dur[resp]) + "\n";
+		classificationDetail += " Total client silence " + to_string(dur[cliSi]) + " average client silence interval " + to_string((double)gapAccum[cliSi]/(count[cliSi]-1)) + "\n";
+		classificationDetail += " Request actual bitrate " + to_string(bytes[req]/dur[req]*8/1024) + "kbps, nominal bitrate " + to_string(bytes[req]/duration()*8/1024) + "kbps.\n";
+		classificationDetail += " Response actual bitrate " + to_string(bytes[resp]/dur[resp]*8/1024) + "kbps, nominal bitrate " + to_string(bytes[resp]/duration()*8/1024) + "kbps.\n";
+	} else {
+		
+		classification = "Unknown";
+		classificationDetail = "Request " + to_string(bytes[req]) + " bytes in " + to_string(dur[req]) + "s / Response " + to_string(bytes[resp]) + " bytes in " + to_string(dur[resp]);
+	}
+}
+
+void ConnectionRecord::packet(Config &config, Flow flow, long dataLength, double timestamp) {
 	if ( flows.empty()) {
 		start = timestamp;
 		flows.push_back(FlowRecord(flow, dataLength, timestamp));
 	} else if (flows.back().flow == flow) {
 		flows.back().addData(dataLength, timestamp);
 	} else {
-		if(timestamp - end > silenceThreshold) { 
-			if(flow == response) {
+		if(timestamp - end > config.minSilencePeriod) { 
+			if(flow == Flow::response) {
 				//request sent, period waiting and then a response indicates it was the server being slow and silent
-				flows.push_back(FlowRecord(serverSilence, 0, end, timestamp));
+				flows.push_back(FlowRecord(Flow::serverSilence, 0, end, timestamp));
 			} else {
 				//response recieved, period waiting before the next request indicates the client didn't have any important work
-				flows.push_back(FlowRecord(clientSilence, 0, end, timestamp));
+				flows.push_back(FlowRecord(Flow::clientSilence, 0, end, timestamp));
 			}
 		}
 		flows.push_back(FlowRecord(flow, dataLength, timestamp));
